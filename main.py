@@ -1,24 +1,57 @@
-from fastapi import FastAPI, Depends, status, Response, HTTPException
+from fastapi import FastAPI, status, HTTPException
 from database import Database
 from datetime import datetime
+import asyncio
+import hashlib
+import uuid
 import schemas
+import time
+
 app = FastAPI()
 db = Database()
 
+# Implement HashSet for locking subsequent API calls
+throttle_requests = set()
 
-# Creation APIs
+# Close database connection on exit
+@app.on_event("shutdown")
+def disconnect_db():
+    db.conn.close()
+
+
+# Account Creation API
 @app.post('/create_account', status_code=201)
-async def create_account(request: schemas.Balance):
-    new_account = db.create_account(request)
+def create_account(request: schemas.Balance):
+    try:
+        db.create_account(request)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Account number already in database.")
     
-    return await db.get_balance(request.account_no)
+    return db.get_balance(request.account_no)
 
-# # Debug APIs : Not to be used
-# @app.get('/accounts')
-# def get_accounts(db: Session=Depends(get_db)):
-#     account_details = db.query(models.Balance).all()
-#     return account_details
+# Debug API: Not to be used
+@app.get('/accounts')
+def get_accounts():
+    account_details = db.cursor.execute("select * from balances").fetchall()
+    return account_details
+    
+# Debug API: Not to be used
+@app.get('/transactions')
+def get_transactions(account):
+    transactions = db.cursor.execute(f"select * from transactions WHERE account_no='{account}'").fetchall()
+    if not transactions:
+        raise HTTPException(status_code=404, detail=f"No transactions found!")
+    return transactions
 
+# Debug API: Not to be used
+@app.get('/all_transactions')
+def get_all_transactions():
+    transactions = db.cursor.execute(f"select * from transactions").fetchall()
+    # if not transactions:
+    #     raise HTTPException(status_code=404, detail=f"No transactions found!")
+    return transactions
+
+# Debug API: Not to be used
 @app.get('/get_balance')
 def get_balance(account):
     account_details = db.get_balance(account)
@@ -31,33 +64,74 @@ def get_balance(account):
 # Transaction API
 @app.post('/transfer')
 async def transfer(transaction:schemas.Transaction):
-    
-    # Check if src account present
-    from_account = db.cursor.execute(f"SELECT * FROM balances WHERE account_no='{transaction.source}'").fetchone()
+
+    # Check if accounts are present
+    from_account = db.cursor.execute(f"SELECT * FROM balances WHERE account_no='{transaction.From}'").fetchone()
     if not from_account:
-        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail=f"Source account({transaction.source}) not in database.")
-    to_account = db.cursor.execute(f"SELECT * FROM balances WHERE account_no='{transaction.destination}'").fetchone()
+        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail={
+            "response":f"Source account({transaction.From}) not in database.",
+            "status": "failed"})
+
+    to_account = db.cursor.execute(f"SELECT * FROM balances WHERE account_no='{transaction.To}'").fetchone()
     if not to_account:
-        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail=f"Destination account({transaction.destination}) not in database.")
+        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail={
+            "response":f"Destination account({transaction.To}) not in database.",
+            "status": "failed"})
+    
+    # Check if "From" and "To" account are same:
+    if transaction.From == transaction.To:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={
+            "response":"Source and destination account can't be same!",
+            "status": "failed"})
 
     # Check if src account has sufficient balance
     if from_account["balance"]<transaction.amount:
-        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail=f"Insufficient amount in source account({transaction.destination}).")
+        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail={
+            "response":f"Insufficient amount in source account({transaction.From}).",
+            "status": "failed"})
+    
+    # Amount is zero on negative
+    if transaction.amount<=0:
+        raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail={
+            "response":"Invalid amount, minimum amount to transfer should be greater than 0.",
+            "status": "failed"})
 
+    
+    # add current transaction to Hash set(To throttle additional requests)
+    throttle_transaction = hashlib.md5((transaction.From+transaction.To).encode()).hexdigest()
+    
+    # Check if throttling condition exists
+    if throttle_transaction in throttle_requests:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail={
+            "response":"Request was throttled, please wait for previous request to complete.",
+            "status": "failed"})
+
+    # lock the current request until it processes
+    throttle_requests.add(throttle_transaction)
+
+    # Generated random transaction ID and adding transaction to DB
+    transaction_id = uuid.uuid4().hex[:8]
+    curr_transaction = db.add_transaction(transaction_id, transaction.From, transaction.amount)
+
+    # Delay to check affect of concurrent requests, uncomment to mimic processing time on large database
+    # await asyncio.sleep(2)
+    
     # Initiate Transaction
     new_src_bal = from_account["balance"]-transaction.amount
     new_dest_bal = to_account["balance"]+transaction.amount
-    from_account = await db.update_balance(transaction.source, new_src_bal)
-    to_account = await db.update_balance(transaction.destination, new_dest_bal)
 
-    # Add Transaction to DB
-    curr_transaction = db.add_transaction(transaction.source, transaction.amount)
+    # update new balance on database
+    from_account = db.update_balance(transaction.From, new_src_bal)
+    to_account = db.update_balance(transaction.To, new_dest_bal)
+
+    # revoke lock, so that other requests from same account can be processed
+    throttle_requests.remove(throttle_transaction)
 
     response = dict()
     response["id"] = curr_transaction["id"]
     response["transfered"] = transaction.amount
-    response["source"] = from_account
-    response["destination"] = to_account
+    response["from"] = from_account
+    response["to"] = to_account
     response["created_datetime"] = datetime.strptime(curr_transaction["created_datetime"], "%Y-%m-%d %H:%M:%S.%f")
     return response
 
