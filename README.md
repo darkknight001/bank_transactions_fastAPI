@@ -219,3 +219,4 @@ TABLE balances
 ## Scope of Improvements
 - Using Redis caching
 - Adding more workers to achieve high scalablity
+- Adding asynchronous database driver(Async ORM/ encode's Database library)
